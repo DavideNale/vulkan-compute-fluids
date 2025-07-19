@@ -1,5 +1,11 @@
+use image::{ImageBuffer, Rgba};
 use std::sync::Arc;
+use vulkano::format::Format;
+use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
+use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
+use vulkano::swapchain::Surface;
 use vulkano::sync::{self, GpuFuture};
+use winit::event_loop::{self, EventLoop};
 
 use vulkano::VulkanLibrary;
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
@@ -9,7 +15,6 @@ use vulkano::command_buffer::allocator::{
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo};
 use vulkano::device::QueueFlags;
 use vulkano::device::{Device, DeviceCreateInfo, QueueCreateInfo};
-use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 
@@ -25,18 +30,35 @@ use vulkano::descriptor_set::DescriptorSet;
 
 use vulkano::pipeline::PipelineBindPoint;
 
+use vulkano::command_buffer::ClearColorImageInfo;
+use vulkano::command_buffer::CopyImageToBufferInfo;
+use vulkano::format::ClearColorValue;
+
 #[allow(unused)]
 fn main() {
     // instance specifies the mapping between vulkano and the local Vulkan library
     let library = VulkanLibrary::new().expect("no local Vulkan library/DLL");
+    let event_loop = EventLoop::new().unwrap(); // ignore this for now
+
+    let required_extensions = Surface::required_extensions(&event_loop).unwrap();
+
     let instance = Instance::new(
         library,
         InstanceCreateInfo {
             flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+            enabled_extensions: required_extensions,
             ..Default::default()
         },
     )
     .expect("failed to create instance");
+    // let instance = Instance::new(
+    //     library,
+    //     InstanceCreateInfo {
+    //         flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+    //         ..Default::default()
+    //     },
+    // )
+    // .expect("failed to create instance");
 
     // select physical device that supports Vulkan
     let physical_device = instance
@@ -166,23 +188,23 @@ fn main() {
     .expect("failed to create buffer");
 
     mod cs {
-        vulkano_shaders::shader! {
+        vulkano_shaders::shader!(
             ty: "compute",
             src: r"
-            #version 460
+                #version 460
 
-            layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+                layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-            layout(set = 0, binding = 0) buffer Data {
-                uint data[];
-            } buf;
+                layout(set = 0, binding = 0) buffer Data {
+                    uint data[];
+                } buf;
 
-            void main() {
-                uint idx = gl_GlobalInvocationID.x;
-                buf.data[idx] *= 12;
-            }
-        ",
-        }
+                void main() {
+                    uint idx = gl_GlobalInvocationID.x;
+                    buf.data[idx] *= 12;
+                }
+            ",
+        );
     }
 
     let shader = cs::load(device.clone()).expect("failed to create shader module");
@@ -271,6 +293,73 @@ fn main() {
     for (n, val) in content.iter().enumerate() {
         assert_eq!(*val, n as u32 * 12);
     }
+
+    println!("Everything succeeded!");
+
+    let image = Image::new(
+        memory_allocator.clone(),
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format: Format::R8G8B8A8_UNORM,
+            extent: [1024, 1024, 1],
+            usage: ImageUsage::TRANSFER_DST | ImageUsage::TRANSFER_SRC,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut builder = AutoCommandBufferBuilder::primary(
+        command_buffer_allocator.clone(),
+        queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )
+    .unwrap();
+
+    let buf = Buffer::from_iter(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+            ..Default::default()
+        },
+        (0..1024 * 1024 * 4).map(|_| 0u8),
+    )
+    .expect("failed to create buffer");
+
+    builder
+        .clear_color_image(ClearColorImageInfo {
+            clear_value: ClearColorValue::Float([0.0, 0.0, 1.0, 1.0]),
+            ..ClearColorImageInfo::image(image.clone())
+        })
+        .unwrap()
+        .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
+            image.clone(),
+            buf.clone(),
+        ))
+        .unwrap();
+
+    let command_buffer = builder.build().unwrap();
+
+    let future = sync::now(device.clone())
+        .then_execute(queue.clone(), command_buffer)
+        .unwrap()
+        .then_signal_fence_and_flush()
+        .unwrap();
+
+    future.wait(None).unwrap();
+
+    let buffer_content = buf.read().unwrap();
+    let image = ImageBuffer::<Rgba<u8>, _>::from_raw(1024, 1024, &buffer_content[..]).unwrap();
+
+    image.save("image.png").unwrap();
 
     println!("Everything succeeded!");
 }
